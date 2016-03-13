@@ -87,7 +87,11 @@ func (tcp *tcpProxySocket) ListenPort() int {
 }
 
 func tryConnect(service proxy.ServicePortName, srcAddr net.Addr, protocol string, proxier *Proxier) (out net.Conn, err error) {
+	// 按照一定的时间间隔 尝试着连接到后方的服务
 	for _, dialTimeout := range endpointDialTimeout {
+		//
+		// 根据: srcAddr来选择endpoint
+		//
 		endpoint, err := proxier.loadBalancer.NextEndpoint(service, srcAddr)
 		if err != nil {
 			glog.Errorf("Couldn't find an endpoint for %s: %v", service, err)
@@ -139,6 +143,8 @@ func (tcp *tcpProxySocket) ProxyLoop(service proxy.ServicePortName, myInfo *serv
 			inConn.Close()
 			continue
 		}
+
+		// 建立inConn和outConn之间的关系
 		// Spin up an async copy loop.
 		go proxyTCP(inConn.(*net.TCPConn), outConn.(*net.TCPConn))
 	}
@@ -155,9 +161,14 @@ func proxyTCP(in, out *net.TCPConn) {
 	wg.Wait()
 }
 
+// 拷贝数据:
+// 长连接 vs. 短连接
+//
 func copyBytes(direction string, dest, src *net.TCPConn, wg *sync.WaitGroup) {
 	defer wg.Done()
 	glog.V(4).Infof("Copying %s: %s -> %s", direction, src.RemoteAddr(), dest.RemoteAddr())
+
+	// 如果是长连接，则一直copy
 	n, err := io.Copy(dest, src)
 	if err != nil {
 		if !isClosedError(err) {

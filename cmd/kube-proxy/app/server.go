@@ -67,6 +67,8 @@ type ProxyServer struct {
 const (
 	proxyModeUserspace              = "userspace"
 	proxyModeIptables               = "iptables"
+
+	// 其他的处于试验状态
 	experimentalProxyModeAnnotation = options.ExperimentalProxyModeAnnotation
 	betaProxyModeAnnotation         = "net.beta.kubernetes.io/proxy-mode"
 )
@@ -128,12 +130,15 @@ func NewProxyServerDefault(config *options.ProxyServerConfig) (*ProxyServer, err
 	} else {
 		glog.Errorf("unable to register configz: %s", err)
 	}
+
+	// 默认采用: Ipv4协议
 	protocol := utiliptables.ProtocolIpv4
 	if net.ParseIP(config.BindAddress).To4() == nil {
 		protocol = utiliptables.ProtocolIpv6
 	}
 
 	// Create a iptables utils.
+	// iptables的操作
 	execer := exec.New()
 	dbus := utildbus.New()
 	iptInterface := utiliptables.New(execer, dbus, protocol)
@@ -195,7 +200,12 @@ func NewProxyServerDefault(config *options.ProxyServerConfig) (*ProxyServer, err
 	var proxier proxy.ProxyProvider
 	var endpointsHandler proxyconfig.EndpointsConfigHandler
 
+	// 代理的模式:
+	// Proxy模式呢?
+	// 还是: userspace or iptables
 	proxyMode := getProxyMode(string(config.Mode), client.Nodes(), hostname, iptInterface, iptables.LinuxKernelCompatTester{})
+
+	// 默认是: iptables 模式
 	if proxyMode == proxyModeIptables {
 		glog.V(0).Info("Using iptables Proxier.")
 		if config.IPTablesMasqueradeBit == nil {
@@ -216,6 +226,9 @@ func NewProxyServerDefault(config *options.ProxyServerConfig) (*ProxyServer, err
 		glog.V(0).Info("Using userspace Proxier.")
 		// This is a proxy.LoadBalancer which NewProxier needs but has methods we don't need for
 		// our config.EndpointsConfigHandler.
+		//
+		// 如果是: userspace, 则采用RR
+		//
 		loadBalancer := userspace.NewLoadBalancerRR()
 		// set EndpointsConfigHandler to our loadBalancer
 		endpointsHandler = loadBalancer
@@ -322,6 +335,7 @@ type nodeGetter interface {
 }
 
 func getProxyMode(proxyMode string, client nodeGetter, hostname string, iptver iptables.IptablesVersioner, kcompat iptables.KernelCompatTester) string {
+	// 现在只支持两种模式
 	if proxyMode == proxyModeUserspace {
 		return proxyModeUserspace
 	} else if proxyMode == proxyModeIptables {
@@ -330,6 +344,7 @@ func getProxyMode(proxyMode string, client nodeGetter, hostname string, iptver i
 		glog.V(1).Infof("Flag proxy-mode=%q unknown, assuming iptables proxy", proxyMode)
 		return tryIptablesProxy(iptver, kcompat)
 	}
+
 	// proxyMode == "" - choose the best option.
 	if client == nil {
 		glog.Errorf("nodeGetter is nil: assuming iptables proxy")

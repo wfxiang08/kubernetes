@@ -58,6 +58,7 @@ type LoadBalancerRR struct {
 }
 
 // Ensure this implements LoadBalancer.
+// 如何确保接口实现呢?
 var _ LoadBalancer = &LoadBalancerRR{}
 
 type balancerState struct {

@@ -46,16 +46,20 @@ func NewDecoder(r io.ReadCloser, codec runtime.Codec) *Decoder {
 // Decode blocks until it can return the next object in the writer. Returns an error
 // if the writer is closed or an object can't be decoded.
 func (d *Decoder) Decode() (watch.EventType, runtime.Object, error) {
+	// 直接通过JSON解码所期待的数据
 	var got WatchEvent
 	if err := d.decoder.Decode(&got); err != nil {
 		return "", nil, err
 	}
+
+	// 结合业务做一些数据的检查
 	switch got.Type {
 	case watch.Added, watch.Modified, watch.Deleted, watch.Error:
 	default:
 		return "", nil, fmt.Errorf("got invalid watch event type: %v", got.Type)
 	}
 
+	// 这个啥意思?
 	obj, err := runtime.Decode(d.codec, got.Object.RawJSON)
 	if err != nil {
 		return "", nil, fmt.Errorf("unable to decode watch event: %v", err)

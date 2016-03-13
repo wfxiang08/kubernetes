@@ -45,6 +45,7 @@ func main() {
 
 	verflag.PrintAndExitIfRequested()
 
+	// 启动Proxy
 	s, err := app.NewProxyServerDefault(config)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
