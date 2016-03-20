@@ -88,7 +88,9 @@ type KernelCompatTester interface {
 // an error if it fails to get the iptables version without error, in which
 // case it will also return false.
 func CanUseIptablesProxier(iptver IptablesVersioner, kcompat KernelCompatTester) (bool, error) {
-	minVersion, err := semver.NewVersion(iptablesMinVersion)
+	// 例如: iptables --version
+	// iptables v1.4.21
+	minVersion, err := semver.NewVersion(iptablesMinVersion) // 1.4.2
 	if err != nil {
 		return false, err
 	}
@@ -148,6 +150,8 @@ func newServiceInfo(service proxy.ServicePortName) *serviceInfo {
 // Proxier is an iptables based proxy for connections between a localhost:lport
 // and services that provide the actual backends.
 type Proxier struct {
+	// 注意代码的组织
+	// mu 和 相关的资源放在一起
 	mu                          sync.Mutex // protects the following fields
 	serviceMap                  map[proxy.ServicePortName]*serviceInfo
 	endpointsMap                map[proxy.ServicePortName][]string
@@ -157,7 +161,7 @@ type Proxier struct {
 
 	// These are effectively const and do not need the mutex to be held.
 	syncPeriod     time.Duration
-	iptables       utiliptables.Interface
+	iptables       utiliptables.Interface // 可以用来操作iptables: util_iptables.Interface
 	masqueradeAll  bool
 	masqueradeMark string
 }
@@ -185,6 +189,9 @@ var _ proxy.ProxyProvider = &Proxier{}
 // An error will be returned if iptables fails to update or acquire the initial lock.
 // Once a proxier is created, it will keep iptables up to date in the background and
 // will not terminate if a particular iptables call fails.
+//
+// kube-proxy的工作模式: 在一台机器上存在，并且一直活着，控制iptables up to date
+//
 func NewProxier(ipt utiliptables.Interface, exec utilexec.Interface, syncPeriod time.Duration, masqueradeAll bool, masqueradeBit int) (*Proxier, error) {
 	// Set the route_localnet sysctl we need for
 	if err := utilsysctl.SetSysctl(sysctlRouteLocalnet, 1); err != nil {
@@ -380,6 +387,8 @@ func (proxier *Proxier) OnServiceUpdate(allServices []api.Service) {
 	defer func() {
 		glog.V(4).Infof("OnServiceUpdate took %v for %d services", time.Since(start), len(allServices))
 	}()
+
+	// 服务列表更新
 	proxier.mu.Lock()
 	defer proxier.mu.Unlock()
 	proxier.haveReceivedServiceUpdate = true
@@ -387,6 +396,7 @@ func (proxier *Proxier) OnServiceUpdate(allServices []api.Service) {
 	activeServices := make(map[proxy.ServicePortName]bool) // use a map as a set
 
 	for i := range allServices {
+		// 遍历每一个Service
 		service := &allServices[i]
 		svcName := types.NamespacedName{
 			Namespace: service.Namespace,
@@ -394,20 +404,36 @@ func (proxier *Proxier) OnServiceUpdate(allServices []api.Service) {
 		}
 
 		// if ClusterIP is "None" or empty, skip proxying
+		// 什么时候为空呢?
+		//	[root@master1 medweb]# kubectl get services
+		//	NAME            CLUSTER_IP        EXTERNAL_IP   PORT(S)    SELECTOR              AGE
+		//	comm-test       192.168.14.122    <none>        3639/TCP   name=comm-test        9d
+		//	kubernetes      192.168.0.1       <none>        443/TCP    <none>                10d
+		//	medweb-dev      192.168.164.36    <none>        8000/TCP   <none>                8h
+		//	message         192.168.108.191   <none>        9090/TCP   name=message          13h
+		//	pedometer       192.168.104.143   <none>        3631/TCP   name=pedometer-test   2d
+		//	robot-test      192.168.207.190   <none>        9090/TCP   name=robot-test       9d
+		//	rpc-dashboard   192.168.192.97    <none>        80/TCP     name=rpc-dashboard    2d
 		if !api.IsServiceIPSet(service) {
 			glog.V(3).Infof("Skipping service %s due to clusterIP = %q", svcName, service.Spec.ClusterIP)
 			continue
 		}
 
+		// 一个Service可以有多个Port呢?
+		// 重新定义 i
 		for i := range service.Spec.Ports {
+			// 如何遍历数组，防止生成中间变量
 			servicePort := &service.Spec.Ports[i]
 
+			// 服务的唯一标志: <namespace, name, port>
 			serviceName := proxy.ServicePortName{
 				NamespacedName: svcName,
 				Port:           servicePort.Name,
 			}
 			activeServices[serviceName] = true
 			info, exists := proxier.serviceMap[serviceName]
+
+			// 如果服务的定义之前存在，且没有变化，则continue
 			if exists && proxier.sameConfig(info, service, servicePort) {
 				// Nothing changed.
 				continue
@@ -434,6 +460,8 @@ func (proxier *Proxier) OnServiceUpdate(allServices []api.Service) {
 		}
 	}
 
+	// 利用: etcd的信息更新: serviceMap
+	// 再次检测serviceMap中是否存在多余的信息，如果有则删除
 	// Remove services missing from the update.
 	for name := range proxier.serviceMap {
 		if !activeServices[name] {
@@ -467,19 +495,27 @@ func (proxier *Proxier) OnEndpointsUpdate(allEndpoints []api.Endpoints) {
 		portsToEndpoints := map[string][]hostPortPair{}
 		for i := range svcEndpoints.Subsets {
 			ss := &svcEndpoints.Subsets[i]
+			// Ports和Addresses的组合: 集合相乘
 			for i := range ss.Ports {
 				port := &ss.Ports[i]
 				for i := range ss.Addresses {
 					addr := &ss.Addresses[i]
+					// port.Name的作用，是否可以不要
 					portsToEndpoints[port.Name] = append(portsToEndpoints[port.Name], hostPortPair{addr.IP, port.Port})
 				}
 			}
 		}
 
+		// portname同一个port规则的集合
 		for portname := range portsToEndpoints {
+			// <service> + portname
 			svcPort := proxy.ServicePortName{NamespacedName: types.NamespacedName{Namespace: svcEndpoints.Namespace, Name: svcEndpoints.Name}, Port: portname}
+			// 对应的endpoints
 			curEndpoints := proxier.endpointsMap[svcPort]
+			// 新的endpoints(Endpoints最终转成为String, 便于后续的比较)
 			newEndpoints := flattenValidEndpoints(portsToEndpoints[portname])
+
+			// 比较:
 			if len(curEndpoints) != len(newEndpoints) || !slicesEquiv(slice.CopyStrings(curEndpoints), newEndpoints) {
 				glog.V(1).Infof("Setting endpoints for %q to %+v", svcPort, newEndpoints)
 				proxier.endpointsMap[svcPort] = newEndpoints
@@ -525,6 +561,7 @@ func flattenValidEndpoints(endpoints []hostPortPair) []string {
 	var result []string
 	for i := range endpoints {
 		hpp := &endpoints[i]
+		// 将Endpoint转换成为String
 		if isValidEndpoint(hpp) {
 			result = append(result, net.JoinHostPort(hpp.host, strconv.Itoa(hpp.port)))
 		} else {
@@ -560,6 +597,9 @@ func (proxier *Proxier) syncProxyRules() {
 	defer func() {
 		glog.V(4).Infof("syncProxyRules took %v", time.Since(start))
 	}()
+
+	// 只要收到变化，不管怎么变的; 其实如果有 Update Callback, 应该就是有变化了
+	//
 	// don't sync rules till we've received services and endpoints
 	if !proxier.haveReceivedEndpointsUpdate || !proxier.haveReceivedServiceUpdate {
 		glog.V(2).Info("Not syncing iptables until Services and Endpoints have been received from master")
@@ -569,14 +609,26 @@ func (proxier *Proxier) syncProxyRules() {
 
 	// Create and link the kube services chain.
 	{
+		// filter, nat 两个iptables的 table
 		tablesNeedServicesChain := []utiliptables.Table{utiliptables.TableFilter, utiliptables.TableNAT}
 		for _, table := range tablesNeedServicesChain {
+			// filter
+			// nat 中存在: chain: KUBE-SERVICES
+			// 如何Ensure呢?
+			// 直接创建一个Chain
+			// 要么: 创建成功， 返回: false, nil
+			//      已经创建, 返回:  true, nil
+			//      完全失败， 返回: false, err
+			// 因此这里只关注 err
+			// 参考： https://app.yinxiang.com/shard/s26/nl/1388904743/16f4521e-d7f7-42f7-bbeb-550882054118/
+			// 用户Chain如何工作呢?
 			if _, err := proxier.iptables.EnsureChain(table, kubeServicesChain); err != nil {
 				glog.Errorf("Failed to ensure that %s chain %s exists: %v", table, kubeServicesChain, err)
 				return
 			}
 		}
 
+		// 在三个环节添加: Jump
 		tableChainsNeedJumpServices := []struct {
 			table utiliptables.Table
 			chain utiliptables.Chain
@@ -588,12 +640,14 @@ func (proxier *Proxier) syncProxyRules() {
 		comment := "kubernetes service portals"
 		args := []string{"-m", "comment", "--comment", comment, "-j", string(kubeServicesChain)}
 		for _, tc := range tableChainsNeedJumpServices {
+			// -m, --comment
 			if _, err := proxier.iptables.EnsureRule(utiliptables.Prepend, tc.table, tc.chain, args...); err != nil {
 				glog.Errorf("Failed to ensure that %s chain %s jumps to %s: %v", tc.table, tc.chain, kubeServicesChain, err)
 				return
 			}
 		}
 	}
+	// 上面的环节: 创建了Chain, 并且将Chain安插到不同的 table  的不同 Chain里面去(第一个元素)
 
 	// Create and link the kube postrouting chain.
 	{
@@ -612,8 +666,10 @@ func (proxier *Proxier) syncProxyRules() {
 
 	// Get iptables-save output so we can check for existing chains and rules.
 	// This will be a map of chain name to chain with rules as stored in iptables-save/iptables-restore
+	// 1. 如何获取 iptable filter的信息: save
 	existingFilterChains := make(map[utiliptables.Chain]string)
 	iptablesSaveRaw, err := proxier.iptables.Save(utiliptables.TableFilter)
+
 	if err != nil { // if we failed to get any rules
 		glog.Errorf("Failed to execute iptables-save, syncing all rules: %v", err)
 	} else { // otherwise parse the output
@@ -703,6 +759,8 @@ func (proxier *Proxier) syncProxyRules() {
 		activeNATChains[svcChain] = true
 
 		// Capture the clusterIP.
+		// http://linux.die.net/man/8/iptables
+		// -m: 额外的match
 		args := []string{
 			"-A", string(kubeServicesChain),
 			"-m", "comment", "--comment", fmt.Sprintf(`"%s cluster IP"`, svcName.String()),
@@ -710,12 +768,15 @@ func (proxier *Proxier) syncProxyRules() {
 			"-d", fmt.Sprintf("%s/32", svcInfo.clusterIP.String()),
 			"--dport", fmt.Sprintf("%d", svcInfo.port),
 		}
+
+		// 对于到目标地址的请求需要: Masquerade
 		if proxier.masqueradeAll {
 			writeLine(natRules, append(args, "-j", string(kubeMarkMasqChain))...)
 		}
 		writeLine(natRules, append(args, "-j", string(svcChain))...)
 
 		// Capture externalIPs.
+		// 暂不考虑外部IP
 		for _, externalIP := range svcInfo.externalIPs {
 			// If the "external" IP happens to be an IP that is local to this
 			// machine, hold the local port open so no other process can open it

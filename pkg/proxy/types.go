@@ -44,6 +44,8 @@ type ServicePortName struct {
 	Port string
 }
 
+// 如何Hash?
+// 首先生成 String
 func (spn ServicePortName) String() string {
 	return fmt.Sprintf("%s:%s", spn.NamespacedName.String(), spn.Port)
 }

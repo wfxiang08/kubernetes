@@ -339,6 +339,7 @@ func getProxyMode(proxyMode string, client nodeGetter, hostname string, iptver i
 	if proxyMode == proxyModeUserspace {
 		return proxyModeUserspace
 	} else if proxyMode == proxyModeIptables {
+		// Iptables比较先进，不一定支持，需要先检测
 		return tryIptablesProxy(iptver, kcompat)
 	} else if proxyMode != "" {
 		glog.V(1).Infof("Flag proxy-mode=%q unknown, assuming iptables proxy", proxyMode)
@@ -379,11 +380,13 @@ func getProxyMode(proxyMode string, client nodeGetter, hostname string, iptver i
 func tryIptablesProxy(iptver iptables.IptablesVersioner, kcompat iptables.KernelCompatTester) string {
 	var err error
 	// guaranteed false on error, error only necessary for debugging
-	useIptablesProxy, err := iptables.CanUseIptablesProxier(iptver, kcompat)
+	useIptablesProxy, err := iptables.CanUseIptablesProxier(iptver, kcompat) // > 1.4.2即可
 	if err != nil {
 		glog.Errorf("Can't determine whether to use iptables proxy, using userspace proxier: %v", err)
 		return proxyModeUserspace
 	}
+
+	// 除非获取明确信息，否则使用Userspace proxy
 	if useIptablesProxy {
 		return proxyModeIptables
 	}

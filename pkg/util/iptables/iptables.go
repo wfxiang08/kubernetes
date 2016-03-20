@@ -202,6 +202,10 @@ func (runner *runner) EnsureChain(table Table, chain Chain) (bool, error) {
 	runner.mu.Lock()
 	defer runner.mu.Unlock()
 
+	// 直接创建一个Chain
+	// 要么: 创建成功， 返回: false, nil
+	//      已经创建, 返回:  true, nil
+	//      完全失败， 返回: false, err
 	out, err := runner.run(opCreateChain, fullArgs)
 	if err != nil {
 		if ee, ok := err.(utilexec.ExitError); ok {
@@ -517,6 +521,8 @@ func getIptablesWaitFlag(vstring string) []string {
 	}
 }
 
+// 例如: iptables --version
+// iptables v1.4.21
 // getIptablesVersionString runs "iptables --version" to get the version string
 // in the form "X.X.X"
 func getIptablesVersionString(exec utilexec.Interface) (string, error) {

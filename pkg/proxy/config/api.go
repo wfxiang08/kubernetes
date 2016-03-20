@@ -27,6 +27,7 @@ import (
 
 // NewSourceAPI creates config source that watches for changes to the services and endpoints.
 func NewSourceAPI(c *client.Client, period time.Duration, servicesChan chan<- ServiceUpdate, endpointsChan chan<- EndpointsUpdate) {
+	// XXX: 监听所有namespace的services, endpoints的变化
 	servicesLW := cache.NewListWatchFromClient(c, "services", api.NamespaceAll, fields.Everything())
 	endpointsLW := cache.NewListWatchFromClient(c, "endpoints", api.NamespaceAll, fields.Everything())
 
@@ -49,6 +50,7 @@ func newServicesSourceApiFromLW(servicesLW cache.ListerWatcher, period time.Dura
 
 func newEndpointsSourceApiFromLW(endpointsLW cache.ListerWatcher, period time.Duration, endpointsChan chan<- EndpointsUpdate) {
 	endpointsPush := func(objs []interface{}) {
+		// 类型转换: []interface{} --> []api.Endpoints
 		var endpoints []api.Endpoints
 		for _, o := range objs {
 			endpoints = append(endpoints, *(o.(*api.Endpoints)))

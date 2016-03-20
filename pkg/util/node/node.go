@@ -29,6 +29,7 @@ import (
 func GetHostname(hostnameOverride string) string {
 	hostname := hostnameOverride
 	if string(hostname) == "" {
+		// 如何获取hostname呢?
 		nodename, err := exec.Command("uname", "-n").Output()
 		if err != nil {
 			glog.Fatalf("Couldn't determine hostname: %v", err)
