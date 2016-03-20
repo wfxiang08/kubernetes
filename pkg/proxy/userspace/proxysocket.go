@@ -99,6 +99,8 @@ func tryConnect(service proxy.ServicePortName, srcAddr net.Addr, protocol string
 		}
 		glog.V(3).Infof("Mapped service %q to endpoint %s", service, endpoint)
 		// TODO: This could spin up a new goroutine to make the outbound connection,
+
+		// XXX: 目标地址来自endpoint
 		// and keep accepting inbound traffic.
 		outConn, err := net.DialTimeout(protocol, endpoint, dialTimeout)
 		if err != nil {
@@ -114,11 +116,14 @@ func tryConnect(service proxy.ServicePortName, srcAddr net.Addr, protocol string
 }
 
 func (tcp *tcpProxySocket) ProxyLoop(service proxy.ServicePortName, myInfo *serviceInfo, proxier *Proxier) {
+	// 一个服务启动之后，如何处理呢?
 	for {
 		if !myInfo.isAlive() {
 			// The service port was closed or replaced.
 			return
 		}
+
+		// 1. 获取新的连接
 		// Block until a connection is made.
 		inConn, err := tcp.Accept()
 		if err != nil {
@@ -136,6 +141,9 @@ func (tcp *tcpProxySocket) ProxyLoop(service proxy.ServicePortName, myInfo *serv
 			glog.Errorf("Accept failed: %v", err)
 			continue
 		}
+
+		// 2. 尝试连接到远端的请求
+		//    inConn.RemoteAddr() 这个是如何理解的?
 		glog.V(3).Infof("Accepted TCP connection from %v to %v", inConn.RemoteAddr(), inConn.LocalAddr())
 		outConn, err := tryConnect(service, inConn.(*net.TCPConn).RemoteAddr(), "tcp", proxier)
 		if err != nil {

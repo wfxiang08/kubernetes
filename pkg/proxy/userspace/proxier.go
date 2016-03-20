@@ -260,7 +260,6 @@ func (proxier *Proxier) Sync() {
 	if err := iptablesInit(proxier.iptables); err != nil {
 		glog.Errorf("Failed to ensure iptables: %v", err)
 	}
-	proxier.ensurePortals()
 	proxier.cleanupStaleStickySessions()
 }
 
@@ -275,18 +274,6 @@ func (proxier *Proxier) SyncLoop() {
 	}
 }
 
-// Ensure that portals exist for all services.
-func (proxier *Proxier) ensurePortals() {
-	proxier.mu.Lock()
-	defer proxier.mu.Unlock()
-	// NB: This does not remove rules that should not be present.
-	for name, info := range proxier.serviceMap {
-		err := proxier.openPortal(name, info)
-		if err != nil {
-			glog.Errorf("Failed to ensure portal for %q: %v", name, err)
-		}
-	}
-}
 
 // clean up any stale sticky session records in the hash map.
 func (proxier *Proxier) cleanupStaleStickySessions() {
@@ -331,6 +318,7 @@ func (proxier *Proxier) setServiceInfo(service proxy.ServicePortName, info *serv
 // Pass proxyPort=0 to allocate a random port. The timeout only applies to UDP
 // connections, for now.
 func (proxier *Proxier) addServiceOnPort(service proxy.ServicePortName, protocol api.Protocol, proxyPort int, timeout time.Duration) (*serviceInfo, error) {
+	//  1. 创建Proxy, 绑定本地的端口
 	sock, err := newProxySocket(protocol, proxier.listenIP, proxyPort)
 	if err != nil {
 		return nil, err
@@ -345,6 +333,8 @@ func (proxier *Proxier) addServiceOnPort(service proxy.ServicePortName, protocol
 		sock.Close()
 		return nil, err
 	}
+
+	// 2. 创建: ServiceInfo
 	si := &serviceInfo{
 		isAliveAtomic:       1,
 		proxyPort:           portNum,
@@ -361,6 +351,8 @@ func (proxier *Proxier) addServiceOnPort(service proxy.ServicePortName, protocol
 	go func(service proxy.ServicePortName, proxier *Proxier) {
 		defer runtime.HandleCrash()
 		atomic.AddInt32(&proxier.numProxyLoops, 1)
+
+		// 建立了client, proxy, backend之间的联系
 		sock.ProxyLoop(service, si, proxier)
 		atomic.AddInt32(&proxier.numProxyLoops, -1)
 	}(service, proxier)
@@ -384,6 +376,7 @@ func (proxier *Proxier) OnServiceUpdate(services []api.Service) {
 		}
 
 		for i := range service.Spec.Ports {
+			// 1. 对于每个服务的每一个端口
 			servicePort := &service.Spec.Ports[i]
 			serviceName := proxy.ServicePortName{NamespacedName: types.NamespacedName{Namespace: service.Namespace, Name: service.Name}, Port: servicePort.Name}
 			activeServices[serviceName] = true
@@ -406,34 +399,44 @@ func (proxier *Proxier) OnServiceUpdate(services []api.Service) {
 				}
 			}
 
+			// 2. 服务绑定本地的端口
 			proxyPort, err := proxier.proxyPorts.AllocateNext()
 			if err != nil {
 				glog.Errorf("failed to allocate proxy port for service %q: %v", serviceName, err)
 				continue
 			}
 
+			// 3. 起一个本地的Server
 			glog.V(1).Infof("Adding new service %q at %s:%d/%s", serviceName, serviceIP, servicePort.Port, servicePort.Protocol)
 			info, err = proxier.addServiceOnPort(serviceName, servicePort.Protocol, proxyPort, proxier.udpIdleTimeout)
 			if err != nil {
 				glog.Errorf("Failed to start proxy for %q: %v", serviceName, err)
 				continue
 			}
+
 			info.portal.ip = serviceIP
 			info.portal.port = servicePort.Port
 			info.externalIPs = service.Spec.ExternalIPs
+
+			// 本地的Proxy如何和后端的Backends进行交互
 			// Deep-copy in case the service instance changes
 			info.loadBalancerStatus = *api.LoadBalancerStatusDeepCopy(&service.Status.LoadBalancer)
 			info.nodePort = servicePort.NodePort
 			info.sessionAffinityType = service.Spec.SessionAffinity
 			glog.V(4).Infof("info: %+v", info)
 
+			// 添加: Portal
 			err = proxier.openPortal(serviceName, info)
 			if err != nil {
 				glog.Errorf("Failed to open portal for %q: %v", serviceName, err)
 			}
+
+			// 添加Service的信息到Lb中
 			proxier.loadBalancer.NewService(serviceName, info.sessionAffinityType, info.stickyMaxAgeMinutes)
 		}
 	}
+
+	// 关闭过期的Service
 	proxier.mu.Lock()
 	defer proxier.mu.Unlock()
 	for name, info := range proxier.serviceMap {
@@ -482,283 +485,7 @@ func ipsEqual(lhs, rhs []string) bool {
 	return true
 }
 
-func (proxier *Proxier) openPortal(service proxy.ServicePortName, info *serviceInfo) error {
-	err := proxier.openOnePortal(info.portal, info.protocol, proxier.listenIP, info.proxyPort, service)
-	if err != nil {
-		return err
-	}
-	for _, publicIP := range info.externalIPs {
-		err = proxier.openOnePortal(portal{net.ParseIP(publicIP), info.portal.port, true}, info.protocol, proxier.listenIP, info.proxyPort, service)
-		if err != nil {
-			return err
-		}
-	}
-	for _, ingress := range info.loadBalancerStatus.Ingress {
-		if ingress.IP != "" {
-			err = proxier.openOnePortal(portal{net.ParseIP(ingress.IP), info.portal.port, false}, info.protocol, proxier.listenIP, info.proxyPort, service)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	if info.nodePort != 0 {
-		err = proxier.openNodePort(info.nodePort, info.protocol, proxier.listenIP, info.proxyPort, service)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
 
-func (proxier *Proxier) openOnePortal(portal portal, protocol api.Protocol, proxyIP net.IP, proxyPort int, name proxy.ServicePortName) error {
-	if local, err := isLocalIP(portal.ip); err != nil {
-		return fmt.Errorf("can't determine if IP is local, assuming not: %v", err)
-	} else if local {
-		err := proxier.claimNodePort(portal.ip, portal.port, protocol, name)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Handle traffic from containers.
-	args := proxier.iptablesContainerPortalArgs(portal.ip, portal.isExternal, false, portal.port, protocol, proxyIP, proxyPort, name)
-	existed, err := proxier.iptables.EnsureRule(iptables.Append, iptables.TableNAT, iptablesContainerPortalChain, args...)
-	if err != nil {
-		glog.Errorf("Failed to install iptables %s rule for service %q, args:%v", iptablesContainerPortalChain, name, args)
-		return err
-	}
-	if !existed {
-		glog.V(3).Infof("Opened iptables from-containers portal for service %q on %s %s:%d", name, protocol, portal.ip, portal.port)
-	}
-	if portal.isExternal {
-		args := proxier.iptablesContainerPortalArgs(portal.ip, false, true, portal.port, protocol, proxyIP, proxyPort, name)
-		existed, err := proxier.iptables.EnsureRule(iptables.Append, iptables.TableNAT, iptablesContainerPortalChain, args...)
-		if err != nil {
-			glog.Errorf("Failed to install iptables %s rule that opens service %q for local traffic, args:%v", iptablesContainerPortalChain, name, args)
-			return err
-		}
-		if !existed {
-			glog.V(3).Infof("Opened iptables from-containers portal for service %q on %s %s:%d for local traffic", name, protocol, portal.ip, portal.port)
-		}
-
-		args = proxier.iptablesHostPortalArgs(portal.ip, true, portal.port, protocol, proxyIP, proxyPort, name)
-		existed, err = proxier.iptables.EnsureRule(iptables.Append, iptables.TableNAT, iptablesHostPortalChain, args...)
-		if err != nil {
-			glog.Errorf("Failed to install iptables %s rule for service %q for dst-local traffic", iptablesHostPortalChain, name)
-			return err
-		}
-		if !existed {
-			glog.V(3).Infof("Opened iptables from-host portal for service %q on %s %s:%d for dst-local traffic", name, protocol, portal.ip, portal.port)
-		}
-		return nil
-	}
-
-	// Handle traffic from the host.
-	args = proxier.iptablesHostPortalArgs(portal.ip, false, portal.port, protocol, proxyIP, proxyPort, name)
-	existed, err = proxier.iptables.EnsureRule(iptables.Append, iptables.TableNAT, iptablesHostPortalChain, args...)
-	if err != nil {
-		glog.Errorf("Failed to install iptables %s rule for service %q", iptablesHostPortalChain, name)
-		return err
-	}
-	if !existed {
-		glog.V(3).Infof("Opened iptables from-host portal for service %q on %s %s:%d", name, protocol, portal.ip, portal.port)
-	}
-	return nil
-}
-
-// Marks a port as being owned by a particular service, or returns error if already claimed.
-// Idempotent: reclaiming with the same owner is not an error
-func (proxier *Proxier) claimNodePort(ip net.IP, port int, protocol api.Protocol, owner proxy.ServicePortName) error {
-	proxier.portMapMutex.Lock()
-	defer proxier.portMapMutex.Unlock()
-
-	// TODO: We could pre-populate some reserved ports into portMap and/or blacklist some well-known ports
-
-	key := portMapKey{ip: ip.String(), port: port, protocol: protocol}
-	existing, found := proxier.portMap[key]
-	if !found {
-		// Hold the actual port open, even though we use iptables to redirect
-		// it.  This ensures that a) it's safe to take and b) that stays true.
-		// NOTE: We should not need to have a real listen()ing socket - bind()
-		// should be enough, but I can't figure out a way to e2e test without
-		// it.  Tools like 'ss' and 'netstat' do not show sockets that are
-		// bind()ed but not listen()ed, and at least the default debian netcat
-		// has no way to avoid about 10 seconds of retries.
-		socket, err := newProxySocket(protocol, ip, port)
-		if err != nil {
-			return fmt.Errorf("can't open node port for %s: %v", key.String(), err)
-		}
-		proxier.portMap[key] = &portMapValue{owner: owner, socket: socket}
-		glog.V(2).Infof("Claimed local port %s", key.String())
-		return nil
-	}
-	if existing.owner == owner {
-		// We are idempotent
-		return nil
-	}
-	return fmt.Errorf("Port conflict detected on port %s.  %v vs %v", key.String(), owner, existing)
-}
-
-// Release a claim on a port.  Returns an error if the owner does not match the claim.
-// Tolerates release on an unclaimed port, to simplify .
-func (proxier *Proxier) releaseNodePort(ip net.IP, port int, protocol api.Protocol, owner proxy.ServicePortName) error {
-	proxier.portMapMutex.Lock()
-	defer proxier.portMapMutex.Unlock()
-
-	key := portMapKey{ip: ip.String(), port: port, protocol: protocol}
-	existing, found := proxier.portMap[key]
-	if !found {
-		// We tolerate this, it happens if we are cleaning up a failed allocation
-		glog.Infof("Ignoring release on unowned port: %v", key)
-		return nil
-	}
-	if existing.owner != owner {
-		return fmt.Errorf("Port conflict detected on port %v (unowned unlock).  %v vs %v", key, owner, existing)
-	}
-	delete(proxier.portMap, key)
-	existing.socket.Close()
-	return nil
-}
-
-func (proxier *Proxier) openNodePort(nodePort int, protocol api.Protocol, proxyIP net.IP, proxyPort int, name proxy.ServicePortName) error {
-	// TODO: Do we want to allow containers to access public services?  Probably yes.
-	// TODO: We could refactor this to be the same code as portal, but with IP == nil
-
-	err := proxier.claimNodePort(nil, nodePort, protocol, name)
-	if err != nil {
-		return err
-	}
-
-	// Handle traffic from containers.
-	args := proxier.iptablesContainerNodePortArgs(nodePort, protocol, proxyIP, proxyPort, name)
-	existed, err := proxier.iptables.EnsureRule(iptables.Append, iptables.TableNAT, iptablesContainerNodePortChain, args...)
-	if err != nil {
-		glog.Errorf("Failed to install iptables %s rule for service %q", iptablesContainerNodePortChain, name)
-		return err
-	}
-	if !existed {
-		glog.Infof("Opened iptables from-containers public port for service %q on %s port %d", name, protocol, nodePort)
-	}
-
-	// Handle traffic from the host.
-	args = proxier.iptablesHostNodePortArgs(nodePort, protocol, proxyIP, proxyPort, name)
-	existed, err = proxier.iptables.EnsureRule(iptables.Append, iptables.TableNAT, iptablesHostNodePortChain, args...)
-	if err != nil {
-		glog.Errorf("Failed to install iptables %s rule for service %q", iptablesHostNodePortChain, name)
-		return err
-	}
-	if !existed {
-		glog.Infof("Opened iptables from-host public port for service %q on %s port %d", name, protocol, nodePort)
-	}
-
-	args = proxier.iptablesNonLocalNodePortArgs(nodePort, protocol, proxyIP, proxyPort, name)
-	existed, err = proxier.iptables.EnsureRule(iptables.Append, iptables.TableFilter, iptablesNonLocalNodePortChain, args...)
-	if err != nil {
-		glog.Errorf("Failed to install iptables %s rule for service %q", iptablesNonLocalNodePortChain, name)
-		return err
-	}
-	if !existed {
-		glog.Infof("Opened iptables from-non-local public port for service %q on %s port %d", name, protocol, nodePort)
-	}
-
-	return nil
-}
-
-func (proxier *Proxier) closePortal(service proxy.ServicePortName, info *serviceInfo) error {
-	// Collect errors and report them all at the end.
-	el := proxier.closeOnePortal(info.portal, info.protocol, proxier.listenIP, info.proxyPort, service)
-	for _, publicIP := range info.externalIPs {
-		el = append(el, proxier.closeOnePortal(portal{net.ParseIP(publicIP), info.portal.port, true}, info.protocol, proxier.listenIP, info.proxyPort, service)...)
-	}
-	for _, ingress := range info.loadBalancerStatus.Ingress {
-		if ingress.IP != "" {
-			el = append(el, proxier.closeOnePortal(portal{net.ParseIP(ingress.IP), info.portal.port, false}, info.protocol, proxier.listenIP, info.proxyPort, service)...)
-		}
-	}
-	if info.nodePort != 0 {
-		el = append(el, proxier.closeNodePort(info.nodePort, info.protocol, proxier.listenIP, info.proxyPort, service)...)
-	}
-	if len(el) == 0 {
-		glog.V(3).Infof("Closed iptables portals for service %q", service)
-	} else {
-		glog.Errorf("Some errors closing iptables portals for service %q", service)
-	}
-	return utilerrors.NewAggregate(el)
-}
-
-func (proxier *Proxier) closeOnePortal(portal portal, protocol api.Protocol, proxyIP net.IP, proxyPort int, name proxy.ServicePortName) []error {
-	el := []error{}
-
-	if local, err := isLocalIP(portal.ip); err != nil {
-		el = append(el, fmt.Errorf("can't determine if IP is local, assuming not: %v", err))
-	} else if local {
-		if err := proxier.releaseNodePort(portal.ip, portal.port, protocol, name); err != nil {
-			el = append(el, err)
-		}
-	}
-
-	// Handle traffic from containers.
-	args := proxier.iptablesContainerPortalArgs(portal.ip, portal.isExternal, false, portal.port, protocol, proxyIP, proxyPort, name)
-	if err := proxier.iptables.DeleteRule(iptables.TableNAT, iptablesContainerPortalChain, args...); err != nil {
-		glog.Errorf("Failed to delete iptables %s rule for service %q", iptablesContainerPortalChain, name)
-		el = append(el, err)
-	}
-
-	if portal.isExternal {
-		args := proxier.iptablesContainerPortalArgs(portal.ip, false, true, portal.port, protocol, proxyIP, proxyPort, name)
-		if err := proxier.iptables.DeleteRule(iptables.TableNAT, iptablesContainerPortalChain, args...); err != nil {
-			glog.Errorf("Failed to delete iptables %s rule for service %q", iptablesContainerPortalChain, name)
-			el = append(el, err)
-		}
-
-		args = proxier.iptablesHostPortalArgs(portal.ip, true, portal.port, protocol, proxyIP, proxyPort, name)
-		if err := proxier.iptables.DeleteRule(iptables.TableNAT, iptablesHostPortalChain, args...); err != nil {
-			glog.Errorf("Failed to delete iptables %s rule for service %q", iptablesHostPortalChain, name)
-			el = append(el, err)
-		}
-		return el
-	}
-
-	// Handle traffic from the host (portalIP is not external).
-	args = proxier.iptablesHostPortalArgs(portal.ip, false, portal.port, protocol, proxyIP, proxyPort, name)
-	if err := proxier.iptables.DeleteRule(iptables.TableNAT, iptablesHostPortalChain, args...); err != nil {
-		glog.Errorf("Failed to delete iptables %s rule for service %q", iptablesHostPortalChain, name)
-		el = append(el, err)
-	}
-
-	return el
-}
-
-func (proxier *Proxier) closeNodePort(nodePort int, protocol api.Protocol, proxyIP net.IP, proxyPort int, name proxy.ServicePortName) []error {
-	el := []error{}
-
-	// Handle traffic from containers.
-	args := proxier.iptablesContainerNodePortArgs(nodePort, protocol, proxyIP, proxyPort, name)
-	if err := proxier.iptables.DeleteRule(iptables.TableNAT, iptablesContainerNodePortChain, args...); err != nil {
-		glog.Errorf("Failed to delete iptables %s rule for service %q", iptablesContainerNodePortChain, name)
-		el = append(el, err)
-	}
-
-	// Handle traffic from the host.
-	args = proxier.iptablesHostNodePortArgs(nodePort, protocol, proxyIP, proxyPort, name)
-	if err := proxier.iptables.DeleteRule(iptables.TableNAT, iptablesHostNodePortChain, args...); err != nil {
-		glog.Errorf("Failed to delete iptables %s rule for service %q", iptablesHostNodePortChain, name)
-		el = append(el, err)
-	}
-
-	// Handle traffic not local to the host
-	args = proxier.iptablesNonLocalNodePortArgs(nodePort, protocol, proxyIP, proxyPort, name)
-	if err := proxier.iptables.DeleteRule(iptables.TableFilter, iptablesNonLocalNodePortChain, args...); err != nil {
-		glog.Errorf("Failed to delete iptables %s rule for service %q", iptablesNonLocalNodePortChain, name)
-		el = append(el, err)
-	}
-
-	if err := proxier.releaseNodePort(nil, nodePort, protocol, name); err != nil {
-		el = append(el, err)
-	}
-
-	return el
-}
 
 func isLocalIP(ip net.IP) (bool, error) {
 	addrs, err := net.InterfaceAddrs()
@@ -782,6 +509,7 @@ func isLocalIP(ip net.IP) (bool, error) {
 var iptablesContainerPortalChain iptables.Chain = "KUBE-PORTALS-CONTAINER"
 var iptablesHostPortalChain iptables.Chain = "KUBE-PORTALS-HOST"
 
+// 暂不考虑
 // Chains for NodePort services
 var iptablesContainerNodePortChain iptables.Chain = "KUBE-NODEPORT-CONTAINER"
 var iptablesHostNodePortChain iptables.Chain = "KUBE-NODEPORT-HOST"

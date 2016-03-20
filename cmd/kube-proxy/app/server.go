@@ -346,7 +346,9 @@ func getProxyMode(proxyMode string, client nodeGetter, hostname string, iptver i
 		return tryIptablesProxy(iptver, kcompat)
 	}
 
+	// 默认情况下如何选择: ProxyMode呢?
 	// proxyMode == "" - choose the best option.
+	// 获取Node的信息
 	if client == nil {
 		glog.Errorf("nodeGetter is nil: assuming iptables proxy")
 		return tryIptablesProxy(iptver, kcompat)
@@ -360,6 +362,9 @@ func getProxyMode(proxyMode string, client nodeGetter, hostname string, iptver i
 		glog.Errorf("Got nil Node %q, assuming iptables proxy: %v", hostname)
 		return tryIptablesProxy(iptver, kcompat)
 	}
+
+	// betaProxyModeAnnotation
+    // experimentalProxyModeAnnotation
 	proxyMode, found := node.Annotations[betaProxyModeAnnotation]
 	if found {
 		glog.V(1).Infof("Found beta annotation %q = %q", betaProxyModeAnnotation, proxyMode)

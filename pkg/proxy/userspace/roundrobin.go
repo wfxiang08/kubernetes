@@ -37,6 +37,8 @@ var (
 	ErrMissingEndpoints    = errors.New("missing endpoints")
 )
 
+// affinityState 如何定义呢?
+// <IP, endpoint>
 type affinityState struct {
 	clientIP string
 	//clientProtocol  api.Protocol //not yet used
@@ -78,10 +80,12 @@ func newAffinityPolicy(affinityType api.ServiceAffinity, ttlMinutes int) *affini
 // NewLoadBalancerRR returns a new LoadBalancerRR.
 func NewLoadBalancerRR() *LoadBalancerRR {
 	return &LoadBalancerRR{
+		// Service是如何管理的呢？ 和rpc_proxy类似
 		services: map[proxy.ServicePortName]*balancerState{},
 	}
 }
 
+// 添加Service的信息
 func (lb *LoadBalancerRR) NewService(svcPort proxy.ServicePortName, affinityType api.ServiceAffinity, ttlMinutes int) error {
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
@@ -96,6 +100,7 @@ func (lb *LoadBalancerRR) newServiceInternal(svcPort proxy.ServicePortName, affi
 	}
 
 	if _, exists := lb.services[svcPort]; !exists {
+		// 创建: Service
 		lb.services[svcPort] = &balancerState{affinity: *newAffinityPolicy(affinityType, ttlMinutes)}
 		glog.V(4).Infof("LoadBalancerRR service %q did not exist, created", svcPort)
 	} else if affinityType != "" {
@@ -121,6 +126,7 @@ func (lb *LoadBalancerRR) NextEndpoint(svcPort proxy.ServicePortName, srcAddr ne
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
 
+	// 获取state, 如果state找不到，则报错
 	state, exists := lb.services[svcPort]
 	if !exists || state == nil {
 		return "", ErrMissingServiceEntry
@@ -132,6 +138,8 @@ func (lb *LoadBalancerRR) NextEndpoint(svcPort proxy.ServicePortName, srcAddr ne
 
 	sessionAffinityEnabled := isSessionAffinity(&state.affinity)
 
+	// 如何选择一个: Endpoint呢?
+	// sessionAffinityEnabled, 则优先考虑之前使用过的Session
 	var ipaddr string
 	if sessionAffinityEnabled {
 		// Caution: don't shadow ipaddr
@@ -149,6 +157,9 @@ func (lb *LoadBalancerRR) NextEndpoint(svcPort proxy.ServicePortName, srcAddr ne
 			return endpoint, nil
 		}
 	}
+
+
+	// 机器和机器之间的关联: Affinity, 似乎没有太大的必要性
 	// Take the next endpoint.
 	endpoint := state.endpoints[state.index]
 	state.index = (state.index + 1) % len(state.endpoints)
@@ -156,6 +167,8 @@ func (lb *LoadBalancerRR) NextEndpoint(svcPort proxy.ServicePortName, srcAddr ne
 	if sessionAffinityEnabled {
 		var affinity *affinityState
 		affinity = state.affinity.affinityMap[ipaddr]
+
+		// 记录下: affinity
 		if affinity == nil {
 			affinity = new(affinityState) //&affinityState{ipaddr, "TCP", "", endpoint, time.Now()}
 			state.affinity.affinityMap[ipaddr] = affinity
@@ -276,6 +289,8 @@ func (lb *LoadBalancerRR) OnEndpointsUpdate(allEndpoints []api.Endpoints) {
 			registeredEndpoints[svcPort] = true
 		}
 	}
+
+	//
 	// Remove endpoints missing from the update.
 	for k := range lb.services {
 		if _, exists := registeredEndpoints[k]; !exists {
@@ -305,6 +320,7 @@ func (lb *LoadBalancerRR) CleanupStaleStickySessions(svcPort proxy.ServicePortNa
 		return
 	}
 	for ip, affinity := range state.affinity.affinityMap {
+		// 如果有一段时间没有使用了，则关闭
 		if int(time.Now().Sub(affinity.lastUsed).Minutes()) >= state.affinity.ttlMinutes {
 			glog.V(4).Infof("Removing client %s from affinityMap for service %q", affinity.clientIP, svcPort)
 			delete(state.affinity.affinityMap, ip)

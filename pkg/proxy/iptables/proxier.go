@@ -775,107 +775,8 @@ func (proxier *Proxier) syncProxyRules() {
 		}
 		writeLine(natRules, append(args, "-j", string(svcChain))...)
 
-		// Capture externalIPs.
-		// 暂不考虑外部IP
-		for _, externalIP := range svcInfo.externalIPs {
-			// If the "external" IP happens to be an IP that is local to this
-			// machine, hold the local port open so no other process can open it
-			// (because the socket might open but it would never work).
-			if local, err := isLocalIP(externalIP); err != nil {
-				glog.Errorf("can't determine if IP is local, assuming not: %v", err)
-			} else if local {
-				lp := localPort{
-					desc:     "externalIP for " + svcName.String(),
-					ip:       externalIP,
-					port:     svcInfo.port,
-					protocol: protocol,
-				}
-				if proxier.portsMap[lp] != nil {
-					newLocalPorts[lp] = proxier.portsMap[lp]
-				} else {
-					socket, err := openLocalPort(&lp)
-					if err != nil {
-						glog.Errorf("can't open %s, skipping this externalIP: %v", lp.String(), err)
-						continue
-					}
-					newLocalPorts[lp] = socket
-				}
-			} // We're holding the port, so it's OK to install iptables rules.
-			args := []string{
-				"-A", string(kubeServicesChain),
-				"-m", "comment", "--comment", fmt.Sprintf(`"%s external IP"`, svcName.String()),
-				"-m", protocol, "-p", protocol,
-				"-d", fmt.Sprintf("%s/32", externalIP),
-				"--dport", fmt.Sprintf("%d", svcInfo.port),
-			}
-			// We have to SNAT packets to external IPs.
-			writeLine(natRules, append(args, "-j", string(kubeMarkMasqChain))...)
 
-			// Allow traffic for external IPs that does not come from a bridge (i.e. not from a container)
-			// nor from a local process to be forwarded to the service.
-			// This rule roughly translates to "all traffic from off-machine".
-			// This is imperfect in the face of network plugins that might not use a bridge, but we can revisit that later.
-			externalTrafficOnlyArgs := append(args,
-				"-m", "physdev", "!", "--physdev-is-in",
-				"-m", "addrtype", "!", "--src-type", "LOCAL")
-			writeLine(natRules, append(externalTrafficOnlyArgs, "-j", string(svcChain))...)
-			dstLocalOnlyArgs := append(args, "-m", "addrtype", "--dst-type", "LOCAL")
-			// Allow traffic bound for external IPs that happen to be recognized as local IPs to stay local.
-			// This covers cases like GCE load-balancers which get added to the local routing table.
-			writeLine(natRules, append(dstLocalOnlyArgs, "-j", string(svcChain))...)
-		}
-
-		// Capture load-balancer ingress.
-		for _, ingress := range svcInfo.loadBalancerStatus.Ingress {
-			if ingress.IP != "" {
-				args := []string{
-					"-A", string(kubeServicesChain),
-					"-m", "comment", "--comment", fmt.Sprintf(`"%s loadbalancer IP"`, svcName.String()),
-					"-m", protocol, "-p", protocol,
-					"-d", fmt.Sprintf("%s/32", ingress.IP),
-					"--dport", fmt.Sprintf("%d", svcInfo.port),
-				}
-				// We have to SNAT packets from external IPs.
-				writeLine(natRules, append(args, "-j", string(kubeMarkMasqChain))...)
-				writeLine(natRules, append(args, "-j", string(svcChain))...)
-			}
-		}
-
-		// Capture nodeports.  If we had more than 2 rules it might be
-		// worthwhile to make a new per-service chain for nodeport rules, but
-		// with just 2 rules it ends up being a waste and a cognitive burden.
-		if svcInfo.nodePort != 0 {
-			// Hold the local port open so no other process can open it
-			// (because the socket might open but it would never work).
-			lp := localPort{
-				desc:     "nodePort for " + svcName.String(),
-				ip:       "",
-				port:     svcInfo.nodePort,
-				protocol: protocol,
-			}
-			if proxier.portsMap[lp] != nil {
-				newLocalPorts[lp] = proxier.portsMap[lp]
-			} else {
-				socket, err := openLocalPort(&lp)
-				if err != nil {
-					glog.Errorf("can't open %s, skipping this nodePort: %v", lp.String(), err)
-					continue
-				}
-				newLocalPorts[lp] = socket
-			} // We're holding the port, so it's OK to install iptables rules.
-
-			args := []string{
-				"-A", string(kubeNodePortsChain),
-				"-m", "comment", "--comment", svcName.String(),
-				"-m", protocol, "-p", protocol,
-				"--dport", fmt.Sprintf("%d", svcInfo.nodePort),
-			}
-			// Nodeports need SNAT.
-			writeLine(natRules, append(args, "-j", string(kubeMarkMasqChain))...)
-			// Jump to the service chain.
-			writeLine(natRules, append(args, "-j", string(svcChain))...)
-		}
-
+		// 如果Service的endpoints为空，则直接REJECT(调用者立即得到错误反馈), 不要DROP
 		// If the service has no endpoints then reject packets.
 		if len(proxier.endpointsMap[svcName]) == 0 {
 			writeLine(filterRules,
@@ -929,6 +830,10 @@ func (proxier *Proxier) syncProxyRules() {
 			}
 			if i < (n - 1) {
 				// Each rule is a probabilistic match.
+				// 概率论: http://ipset.netfilter.org/iptables-extensions.man.html
+				// 随机转发
+				// 1 / N
+				// (N - 1) / N * 1 / (N - 1) --> 1 /N
 				args = append(args,
 					"-m", "statistic",
 					"--mode", "random",
